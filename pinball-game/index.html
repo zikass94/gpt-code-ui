@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<!--
+  This meta tag tells the phone's browser:
+  - don't let the user pinch-zoom or double-tap-zoom (user-scalable=no)
+  - use the device's real width as the page width
+  This is important so the game doesn't wobble around when you touch it.
+-->
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<title>Gothic Bullet-Hell Pinball</title>
+<style>
+  /* ============================================================
+     BASIC PAGE STYLING
+     Goal: make the page fill the whole phone screen, with no
+     scrollbars, no text selection, and no "rubber band" bounce.
+     ============================================================ */
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: #0a0006; /* almost-black gothic background */
+    overflow: hidden; /* never show scrollbars */
+    -webkit-user-select: none;
+    user-select: none;
+    touch-action: none; /* tells the browser: "I will handle all touches myself" */
+  }
+
+  /* The container centers the canvas on screen, regardless of phone size. */
+  #game-container {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    touch-action: none;
+  }
+
+  #game-canvas {
+    background: #1a0d12;
+    touch-action: none; /* extra safety: no browser gestures on the canvas itself */
+    display: block;
+  }
+
+  /* ============================================================
+     ON-SCREEN BUTTONS (Launch + Nudge)
+     These float on top of the canvas in the bottom corners.
+     ============================================================ */
+  .control-btn {
+    position: fixed;
+    bottom: 18px;
+    width: 84px;
+    height: 84px;
+    border-radius: 50%;
+    border: 3px solid #6e1423;
+    background: rgba(40, 8, 14, 0.85);
+    color: #e8d8c3;
+    font-family: sans-serif;
+    font-size: 13px;
+    font-weight: bold;
+    letter-spacing: 0.5px;
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+    z-index: 10;
+  }
+  .control-btn:active {
+    background: rgba(110, 20, 35, 0.95);
+  }
+  #nudge-btn { left: 18px; }
+  #launch-btn { right: 18px; }
+</style>
+</head>
+<body>
+
+  <div id="game-container">
+    <canvas id="game-canvas"></canvas>
+  </div>
+
+  <!-- These are real DOM buttons (not drawn on the canvas) so the phone
+       gives us nice, reliable touch events for them. -->
+  <button id="nudge-btn" class="control-btn">NUDGE</button>
+  <button id="launch-btn" class="control-btn">LAUNCH</button>
+
+  <!-- Matter.js: the physics engine. This is the ONLY external library we use. -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/matter.min.js"></script>
+
+  <script>
+  'use strict';
+
+  /* ================================================================
+     CONFIG
+     ----------------------------------------------------------------
+     Every "tunable" number in the game lives here. If the ball feels
+     too floaty, too bouncy, or the flippers feel too weak/strong,
+     this is the only place you should need to change numbers.
+
+     All positions/sizes are in "table units" -- an imaginary table
+     that is always 400 units wide and 700 units tall, no matter what
+     phone screen it's shown on. The game scales that table to fit
+     your actual screen (see Game.resize below).
+     ================================================================ */
+  const CONFIG = {
+    table: {
+      width: 400,
+      height: 700,
+      wallThickness: 10,
+    },
+
+    physics: {
+      // Matter.js gravity.y of 1 is "normal" strength. Higher = ball falls faster.
+      gravity: 1.0,
+      ballRadius: 9,
+      ballRestitution: 0.42,  // bounciness: 0 = no bounce, 1 = perfect bounce
+      ballFriction: 0.04,     // friction when sliding against surfaces
+      ballFrictionAir: 0.0006,// air drag -- tiny amount so the ball doesn't feel "floaty"
+      ballDensity: 0.045,
+    },
+
+    flipper: {
+      length: 92,           // how long each flipper bar is
+      thickness: 16,
+      restAngleOffset: 0.46,  // radians, how far DOWN the flipper rests (tip pointing down/out)
+      upAngleOffset: 0.78,    // radians, how far UP the flipper swings when activated
+      angularSpeed: 0.32,     // how fast the flipper rotates per physics step (higher = snappier)
+      snapThreshold: 0.03,    // when this close to its target angle, snap exactly to it
+      density: 0.09,
+      leftPivot: { x: 120, y: 638 },
+      rightPivot: { x: 280, y: 638 },
+    },
+
+    plunger: {
+      laneWallX: 350,        // x position of the wall separating the lane from the main table
+      laneOpeningY: 150,     // above this y, there's no wall -- ball can fly over into the table
+      startPos: { x: 374, y: 648 }, // where the ball waits before being launched
+      launchVelocity: 27,    // upward speed (table units / step) applied when you hit Launch
+    },
+
+    nudge: {
+      // A nudge gives the ball a small random sideways kick.
+      // (Later milestones will also add a "tilt" penalty for nudging too much.)
+      maxVelocityKick: 3.5,
+    },
+
+    drain: {
+      // If the ball's y position goes past this, it has fallen off the
+      // bottom of the table -- time to give the player a new ball.
+      y: 705,
+    },
+  };
+
+  /* ================================================================
+     Matter.js shortcuts
+     ================================================================ */
+  const { Engine, World, Bodies, Body, Constraint, Events } = Matter;
+
+  /* ================================================================
+     GAME STATE (shared across sections below)
+     ================================================================ */
+  const canvas = document.getElementById('game-canvas');
+  const ctx = canvas.getContext('2d');
+
+  let engine, world;
+  let ball;
+  let leftFlipper, rightFlipper;
+  let staticBodies = []; // walls, lane separator -- things that never move
+
+  /* ================================================================
+     GameManager
+     ----------------------------------------------------------------
+     This will become the "brain" of the game (score, balls left,
+     jackpots, modes...) in later milestones. For now it only needs
+     to know whether the ball is sitting in the plunger lane, waiting
+     to be launched, or out in the table being played.
+     ================================================================ */
+  const GameManager = {
+    ballWaiting: true, // true = ball is parked in the plunger lane
+
+    // Called every physics step to see if the ball fell off the table.
+    checkDrain() {
+      if (!this.ballWaiting && ball.position.y > CONFIG.drain.y) {
+        this.returnBallToLane();
+      }
+    },
+
+    returnBallToLane() {
+      Body.setPosition(ball, CONFIG.plunger.startPos);
+      Body.setVelocity(ball, { x: 0, y: 0 });
+      Body.setAngularVelocity(ball, 0);
+      Body.setStatic(ball, true); // freeze it in place until launched again
+      this.ballWaiting = true;
+    },
+
+    launchBall() {
+      if (!this.ballWaiting) return; // already in play -- ignore extra taps
+      Body.setStatic(ball, false);
+      Body.setVelocity(ball, { x: 0, y: -CONFIG.plunger.launchVelocity });
+      this.ballWaiting = false;
+    },
+
+    nudgeBall() {
+      if (this.ballWaiting) return; // nothing to nudge if the ball isn't in play
+      const kick = (Math.random() * 2 - 1) * CONFIG.nudge.maxVelocityKick;
+      Body.setVelocity(ball, { x: ball.velocity.x + kick, y: ball.velocity.y });
+    },
+  };
+
+  /* ================================================================
+     Table
+     ----------------------------------------------------------------
+     Builds every static (non-moving) Matter.js body: the outer walls
+     and the wall that separates the plunger lane from the main table.
+     ================================================================ */
+  const Table = {
+    build() {
+      const W = CONFIG.table.width;
+      const H = CONFIG.table.height;
+      const t = CONFIG.table.wallThickness;
+      const wallOptions = {
+        isStatic: true,
+        restitution: 0.3,
+        friction: 0.05,
+        label: 'wall',
+      };
+
+      const leftWall = Bodies.rectangle(t / 2, H / 2, t, H, wallOptions);
+      const rightOuterWall = Bodies.rectangle(W - t / 2, H / 2, t, H, wallOptions);
+      const topWall = Bodies.rectangle(W / 2, t / 2, W, t, wallOptions);
+
+      // The lane separator only covers the BOTTOM part of the table
+      // (from laneOpeningY down to the floor). Above that y value there
+      // is no wall, so a launched ball can fly up and over into the
+      // main playfield.
+      const laneWallHeight = H - CONFIG.plunger.laneOpeningY;
+      const laneWall = Bodies.rectangle(
+        CONFIG.plunger.laneWallX,
+        CONFIG.plunger.laneOpeningY + laneWallHeight / 2,
+        12,
+        laneWallHeight,
+        wallOptions
+      );
+
+      staticBodies = [leftWall, rightOuterWall, topWall, laneWall];
+      World.add(world, staticBodies);
+    },
+
+    // Draws the walls and lane so the player can see the table shape.
+    render() {
+      ctx.fillStyle = '#241019';
+      ctx.fillRect(0, 0, CONFIG.table.width, CONFIG.table.height);
+
+      ctx.fillStyle = '#3d1a26';
+      for (const body of staticBodies) {
+        const vertices = body.vertices;
+        ctx.beginPath();
+        ctx.moveTo(vertices[0].x, vertices[0].y);
+        for (let i = 1; i < vertices.length; i++) {
+          ctx.lineTo(vertices[i].x, vertices[i].y);
+        }
+        ctx.closePath();
+        ctx.fill();
+      }
+
+      // Dashed line marking the drain (just a visual guide for now).
+      ctx.strokeStyle = '#7a2330';
+      ctx.setLineDash([6, 6]);
+      ctx.beginPath();
+      ctx.moveTo(0, CONFIG.drain.y);
+      ctx.lineTo(CONFIG.plunger.laneWallX, CONFIG.drain.y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    },
+  };
+
+  /* ================================================================
+     Ball
+     ================================================================ */
+  const Ball = {
+    create() {
+      ball = Bodies.circle(
+        CONFIG.plunger.startPos.x,
+        CONFIG.plunger.startPos.y,
+        CONFIG.physics.ballRadius,
+        {
+          restitution: CONFIG.physics.ballRestitution,
+          friction: CONFIG.physics.ballFriction,
+          frictionAir: CONFIG.physics.ballFrictionAir,
+          density: CONFIG.physics.ballDensity,
+          label: 'ball',
+          isStatic: true, // starts parked in the lane; GameManager.launchBall() frees it
+        }
+      );
+      World.add(world, ball);
+    },
+
+    render() {
+      ctx.beginPath();
+      ctx.arc(ball.position.x, ball.position.y, CONFIG.physics.ballRadius, 0, Math.PI * 2);
+      ctx.fillStyle = '#e8d8c3';
+      ctx.fill();
+      ctx.strokeStyle = '#6e1423';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    },
+  };
+
+  /* ================================================================
+     Flippers
+     ----------------------------------------------------------------
+     A flipper is a rectangle body pinned at one end to a fixed pivot
+     point with a Matter.js Constraint (think: a hinge/nail it can
+     swing around). Every physics step we look at whether the flipper
+     is "activated" (finger down on that side of the screen) and spin
+     it towards its "up" angle or let it fall back to its "rest" angle.
+     ================================================================ */
+  function createFlipper(pivot, facingRight) {
+    const len = CONFIG.flipper.length;
+    const thickness = CONFIG.flipper.thickness;
+
+    // facingRight=true  -> flipper extends to the RIGHT of its pivot (the left flipper)
+    // facingRight=false -> flipper extends to the LEFT of its pivot (the right flipper)
+    const dir = facingRight ? 1 : -1;
+    const restAngle = facingRight
+      ? CONFIG.flipper.restAngleOffset
+      : Math.PI - CONFIG.flipper.restAngleOffset;
+    const upAngle = facingRight
+      ? -CONFIG.flipper.upAngleOffset
+      : Math.PI + CONFIG.flipper.upAngleOffset;
+
+    const body = Bodies.rectangle(
+      pivot.x + dir * (len / 2),
+      pivot.y,
+      len,
+      thickness,
+      {
+        density: CONFIG.flipper.density,
+        friction: 0.1,
+        restitution: 0.1,
+        label: 'flipper',
+      }
+    );
+    Body.setAngle(body, restAngle);
+
+    // Pin the pivot-end of the rectangle to the fixed pivot point in the world.
+    const pivotLocalX = -dir * (len / 2);
+    const constraint = Constraint.create({
+      pointA: { x: pivot.x, y: pivot.y },
+      bodyB: body,
+      pointB: { x: pivotLocalX, y: 0 },
+      length: 0,
+      stiffness: 1,
+    });
+
+    World.add(world, [body, constraint]);
+
+    return {
+      body,
+      restAngle,
+      upAngle,
+      activated: false,
+    };
+  }
+
+  function updateFlipper(flipper) {
+    const target = flipper.activated ? flipper.upAngle : flipper.restAngle;
+    const diff = target - flipper.body.angle;
+
+    if (Math.abs(diff) < CONFIG.flipper.snapThreshold) {
+      // Close enough -- stop and snap exactly onto the target angle so
+      // it doesn't jitter forever trying to reach it precisely.
+      Body.setAngularVelocity(flipper.body, 0);
+      Body.setAngle(flipper.body, target);
+    } else {
+      const direction = Math.sign(diff);
+      Body.setAngularVelocity(flipper.body, direction * CONFIG.flipper.angularSpeed);
+    }
+  }
+
+  function renderFlipper(flipper) {
+    const { body } = flipper;
+    ctx.save();
+    ctx.translate(body.position.x, body.position.y);
+    ctx.rotate(body.angle);
+    const len = CONFIG.flipper.length;
+    const thick = CONFIG.flipper.thickness;
+    ctx.fillStyle = '#9c2b3a';
+    ctx.beginPath();
+    // ctx.roundRect() is fairly new -- fall back to a plain rectangle
+    // on any browser that doesn't support it yet, so we never crash.
+    if (typeof ctx.roundRect === 'function') {
+      ctx.roundRect(-len / 2, -thick / 2, len, thick, thick / 2);
+    } else {
+      ctx.rect(-len / 2, -thick / 2, len, thick);
+    }
+    ctx.fill();
+    ctx.restore();
+  }
+
+  /* ================================================================
+     Input
+     ----------------------------------------------------------------
+     We use Pointer Events because they work for touch, mouse AND pen
+     with the same code -- handy since you'll mostly test on a phone,
+     but it also means a desktop browser works for quick checks.
+
+     Rule: tap LEFT half of the screen -> left flipper up.
+           tap RIGHT half of the screen -> right flipper up.
+     The Launch and Nudge buttons are separate DOM elements, so we
+     ignore taps that land on a <button>.
+     ================================================================ */
+  const Input = {
+    // Track active pointer ids per side, so two fingers on the same
+    // side (or releasing one of two) behaves correctly.
+    leftPointers: new Set(),
+    rightPointers: new Set(),
+
+    init() {
+      window.addEventListener('pointerdown', (e) => this.onPointerDown(e));
+      window.addEventListener('pointerup', (e) => this.onPointerUp(e));
+      window.addEventListener('pointercancel', (e) => this.onPointerUp(e));
+
+      // Stop the page from scrolling/zooming no matter where you touch.
+      document.addEventListener('touchmove', (e) => e.preventDefault(), { passive: false });
+      document.addEventListener('gesturestart', (e) => e.preventDefault());
+
+      document.getElementById('launch-btn').addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        GameManager.launchBall();
+      });
+      document.getElementById('nudge-btn').addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        GameManager.nudgeBall();
+      });
+    },
+
+    onPointerDown(e) {
+      if (e.target.closest('button')) return; // let the button's own handler deal with it
+      e.preventDefault();
+      const isLeftSide = e.clientX < window.innerWidth / 2;
+      if (isLeftSide) {
+        this.leftPointers.add(e.pointerId);
+      } else {
+        this.rightPointers.add(e.pointerId);
+      }
+      this.syncFlipperState();
+    },
+
+    onPointerUp(e) {
+      this.leftPointers.delete(e.pointerId);
+      this.rightPointers.delete(e.pointerId);
+      this.syncFlipperState();
+    },
+
+    syncFlipperState() {
+      leftFlipper.activated = this.leftPointers.size > 0;
+      rightFlipper.activated = this.rightPointers.size > 0;
+    },
+  };
+
+  /* ================================================================
+     Game
+     ----------------------------------------------------------------
+     Sets everything up, handles resizing the canvas to fit any phone
+     screen, and runs the main loop.
+     ================================================================ */
+  const Game = {
+    init() {
+      engine = Engine.create();
+      world = engine.world;
+      world.gravity.y = CONFIG.physics.gravity;
+
+      Table.build();
+      Ball.create();
+      leftFlipper = createFlipper(CONFIG.flipper.leftPivot, true);
+      rightFlipper = createFlipper(CONFIG.flipper.rightPivot, false);
+
+      Input.init();
+      this.resize();
+      window.addEventListener('resize', () => this.resize());
+
+      this.lastTime = performance.now();
+      this.accumulator = 0;
+      requestAnimationFrame((t) => this.loop(t));
+    },
+
+    // Makes the fixed-size logical table (400x700 units) fit neatly
+    // inside whatever the phone's actual screen size is, without
+    // stretching or distorting it.
+    resize() {
+      const screenW = window.innerWidth;
+      const screenH = window.innerHeight;
+      const tableAspect = CONFIG.table.width / CONFIG.table.height;
+      const screenAspect = screenW / screenH;
+
+      let displayWidth, displayHeight;
+      if (screenAspect > tableAspect) {
+        displayHeight = screenH;
+        displayWidth = displayHeight * tableAspect;
+      } else {
+        displayWidth = screenW;
+        displayHeight = displayWidth / tableAspect;
+      }
+
+      canvas.style.width = displayWidth + 'px';
+      canvas.style.height = displayHeight + 'px';
+
+      // Use devicePixelRatio so the canvas looks crisp (not blurry) on
+      // high-density phone screens, while game logic still works in
+      // simple 400x700 table units.
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = CONFIG.table.width * dpr;
+      canvas.height = CONFIG.table.height * dpr;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    },
+
+    // The main loop. We step physics in fixed-size chunks (FIXED_DT)
+    // even if the phone's frame rate wobbles a bit -- this keeps the
+    // flippers and ball feeling consistent instead of jittery.
+    loop(now) {
+      requestAnimationFrame((t) => this.loop(t));
+
+      const FIXED_DT = 1000 / 60;
+      let delta = now - this.lastTime;
+      this.lastTime = now;
+      if (delta > 250) delta = 250; // avoid a huge jump if the tab was backgrounded
+
+      this.accumulator += delta;
+      while (this.accumulator >= FIXED_DT) {
+        updateFlipper(leftFlipper);
+        updateFlipper(rightFlipper);
+        Engine.update(engine, FIXED_DT);
+        GameManager.checkDrain();
+        this.accumulator -= FIXED_DT;
+      }
+
+      this.render();
+    },
+
+    render() {
+      ctx.clearRect(0, 0, CONFIG.table.width, CONFIG.table.height);
+      Table.render();
+      renderFlipper(leftFlipper);
+      renderFlipper(rightFlipper);
+      Ball.render();
+    },
+  };
+
+  Game.init();
+  </script>
+
+</body>
+</html>
