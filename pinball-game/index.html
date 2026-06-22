@@ -74,6 +74,53 @@
   }
   #nudge-btn { left: 18px; }
   #launch-btn { right: 18px; }
+
+  /* ============================================================
+     ERROR BANNER
+     If anything ever breaks (e.g. a typo, or the physics library
+     failing to load), this shows the error as plain readable text
+     right on the screen. Without this, a phone player has no way
+     to tell us what went wrong -- there's no "console" to check.
+     ============================================================ */
+  #error-banner {
+    display: none;
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    max-height: 50%;
+    overflow-y: auto;
+    background: #b00020;
+    color: white;
+    font-family: monospace;
+    font-size: 13px;
+    padding: 10px;
+    box-sizing: border-box;
+    z-index: 100;
+    white-space: pre-wrap;
+  }
+
+  /* ============================================================
+     DEBUG READOUT
+     A tiny live status line, top-left, so we can tell from a
+     screenshot alone whether taps are being registered and what
+     the ball/flippers are doing. Safe to delete once everything
+     is confirmed working well.
+     ============================================================ */
+  #debug-readout {
+    position: fixed;
+    top: 4px;
+    left: 4px;
+    color: #ffe9b3;
+    font-family: monospace;
+    font-size: 11px;
+    line-height: 1.4;
+    background: rgba(0,0,0,0.5);
+    padding: 4px 6px;
+    z-index: 20;
+    pointer-events: none;
+    white-space: pre;
+  }
 </style>
 </head>
 <body>
@@ -87,8 +134,32 @@
   <button id="nudge-btn" class="control-btn">NUDGE</button>
   <button id="launch-btn" class="control-btn">LAUNCH</button>
 
+  <div id="error-banner"></div>
+  <div id="debug-readout"></div>
+
+  <!-- This tiny script runs FIRST, before anything else, so it can
+       catch and display ANY error -- even one that happens while the
+       Matter.js library below is loading (e.g. if your network blocks
+       the CDN link). Without this, a crash would just look like
+       "nothing happens" with no clue why. -->
+  <script>
+    function showError(message) {
+      var banner = document.getElementById('error-banner');
+      banner.style.display = 'block';
+      banner.textContent = 'Something went wrong:\n' + message +
+        '\n\nTake a screenshot of this red box and send it back -- it tells us exactly what broke.';
+    }
+    window.addEventListener('error', function (e) {
+      showError(e.message + (e.filename ? '\n(' + e.filename + ':' + e.lineno + ')' : ''));
+    });
+    window.addEventListener('unhandledrejection', function (e) {
+      showError(String(e.reason));
+    });
+  </script>
+
   <!-- Matter.js: the physics engine. This is the ONLY external library we use. -->
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/matter.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/matter.min.js"
+          onerror="showError('Failed to load the Matter.js physics library from the CDN. Check your internet connection and try again.')"></script>
 
   <script>
   'use strict';
@@ -164,6 +235,7 @@
      ================================================================ */
   const canvas = document.getElementById('game-canvas');
   const ctx = canvas.getContext('2d');
+  const debugEl = document.getElementById('debug-readout');
 
   let engine, world;
   let ball;
@@ -251,10 +323,21 @@
 
     // Draws the walls and lane so the player can see the table shape.
     render() {
-      ctx.fillStyle = '#241019';
+      // Background: the open playfield the ball moves through.
+      ctx.fillStyle = '#160a10';
       ctx.fillRect(0, 0, CONFIG.table.width, CONFIG.table.height);
 
-      ctx.fillStyle = '#3d1a26';
+      // A bright border around the whole table so its edges are always
+      // visible, even on a small/bright phone screen.
+      ctx.strokeStyle = '#caa86b';
+      ctx.lineWidth = 3;
+      ctx.strokeRect(1.5, 1.5, CONFIG.table.width - 3, CONFIG.table.height - 3);
+
+      // Walls: a clearly brighter color than the background, with an
+      // outline, so they actually stand out instead of blending in.
+      ctx.fillStyle = '#7a2e44';
+      ctx.strokeStyle = '#caa86b';
+      ctx.lineWidth = 1.5;
       for (const body of staticBodies) {
         const vertices = body.vertices;
         ctx.beginPath();
@@ -264,10 +347,12 @@
         }
         ctx.closePath();
         ctx.fill();
+        ctx.stroke();
       }
 
       // Dashed line marking the drain (just a visual guide for now).
-      ctx.strokeStyle = '#7a2330';
+      ctx.strokeStyle = '#ff6b81';
+      ctx.lineWidth = 2;
       ctx.setLineDash([6, 6]);
       ctx.beginPath();
       ctx.moveTo(0, CONFIG.drain.y);
@@ -301,10 +386,10 @@
     render() {
       ctx.beginPath();
       ctx.arc(ball.position.x, ball.position.y, CONFIG.physics.ballRadius, 0, Math.PI * 2);
-      ctx.fillStyle = '#e8d8c3';
+      ctx.fillStyle = '#fff6e0';
       ctx.fill();
-      ctx.strokeStyle = '#6e1423';
-      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = '#2a0a0f';
+      ctx.lineWidth = 2;
       ctx.stroke();
     },
   };
@@ -388,7 +473,7 @@
     ctx.rotate(body.angle);
     const len = CONFIG.flipper.length;
     const thick = CONFIG.flipper.thickness;
-    ctx.fillStyle = '#9c2b3a';
+    ctx.fillStyle = '#e6394f';
     ctx.beginPath();
     // ctx.roundRect() is fairly new -- fall back to a plain rectangle
     // on any browser that doesn't support it yet, so we never crash.
@@ -547,6 +632,14 @@
       renderFlipper(leftFlipper);
       renderFlipper(rightFlipper);
       Ball.render();
+
+      // Temporary debug text -- proves on a screenshot whether taps are
+      // actually reaching the game. Safe to remove later.
+      debugEl.textContent =
+        'ball: ' + Math.round(ball.position.x) + ',' + Math.round(ball.position.y) +
+        (GameManager.ballWaiting ? ' (waiting)' : ' (in play)') + '\n' +
+        'left flipper active: ' + leftFlipper.activated + '\n' +
+        'right flipper active: ' + rightFlipper.activated;
     },
   };
 
